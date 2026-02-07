@@ -390,8 +390,10 @@ load_clauses_for_tracing(Clauses) :-
     % Assert each clause into the database
     maplist(assert_clause_safely, LoadableClauses).
 
-is_loadable_clause((:- _)) :- !, fail.  % Skip directives
-is_loadable_clause(_) :- true.  % Accept everything else
+is_loadable_clause((:- use_module(_))) :- !, fail.  % Skip use_module directives
+is_loadable_clause((:- module(_, _))) :- !, fail.   % Skip module declarations
+is_loadable_clause((:- _)) :- !, fail.  % Skip other directives (they may have side effects)
+is_loadable_clause(_) :- true.  % Accept all actual clauses
 
 assert_clause_safely(Clause) :-
     catch(
@@ -598,7 +600,8 @@ generate_test_inputs(Arity, TestInputs) :-
 
 generate_input_for_n(1, N, [N]) :- !.  % Single input: use N directly
 generate_input_for_n(Arity, N, Inputs) :-
-    % Multiple inputs: generate list of N values
+    % Multiple inputs: generate list with Arity copies of N
+    % (all inputs receive the same value for simplicity)
     findall(N, between(1, Arity, _), Inputs).
 
 collect_outputs(_Name, _Arity, [], []).
@@ -633,12 +636,18 @@ build_equations_from_trace(TraceData, EquationSystem) :-
     findall(Equation,
             extract_equation_from_trace(TraceData, Equation),
             AllEquations),
-    % Limit to 4 equations for a cubic polynomial (or the number available)
-    (length(AllEquations, Len), Len >= 4 ->
-        length(LimitedEquations, 4),
+    % For a cubic polynomial (degree 3), we need degree+1 = 4 equations
+    % Limit to this number (or the number available if fewer)
+    polynomial_degree(3, NumEquationsNeeded),
+    (length(AllEquations, Len), Len >= NumEquationsNeeded ->
+        length(LimitedEquations, NumEquationsNeeded),
         append(LimitedEquations, _, AllEquations),
         EquationSystem = LimitedEquations
     ; EquationSystem = AllEquations).
+
+% Define the polynomial degree used for fitting
+polynomial_degree(Degree, NumEquations) :-
+    NumEquations is Degree + 1.
 
 extract_equation_from_trace(TraceData, equation(Vars, Result)) :-
     member(trace(_Pred, DataPoints), TraceData),
@@ -945,8 +954,13 @@ write_closed_form(Stream, closed_form(Pred, formula(Coeffs))) :-
     format(Stream, '~n~n', []).
 
 write_formula_human(Stream, Coeffs) :-
-    Coeffs = [C0, C1, C2, C3],
-    format(Stream, '~w + ~w*n + ~w*n^2 + ~w*n^3', [C0, C1, C2, C3]).
+    % Handle cubic polynomials (4 coefficients)
+    (Coeffs = [C0, C1, C2, C3] ->
+        format(Stream, '~w + ~w*n + ~w*n^2 + ~w*n^3', [C0, C1, C2, C3])
+    ;
+        % Fallback for other polynomial degrees
+        format(Stream, 'Coefficients: ~w', [Coeffs])
+    ).
 
 write_optimized_predicates(Stream, Tagged) :-
     findall(Pred, 
