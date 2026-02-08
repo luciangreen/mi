@@ -41,6 +41,9 @@ process_file(InputFile, OutputFile) :-
     % Step 1: Parse Prolog clauses from file
     parse_file_clauses(InputFile, Clauses),
     
+    % Step 1.5: Load the clauses into the Prolog environment so they can be traced
+    load_clauses_for_tracing(Clauses),
+    
     % Step 2: Detect recursive/nested predicates
     detect_recursive(Clauses, RecursiveInfo),
     
@@ -63,7 +66,7 @@ process_file(InputFile, OutputFile) :-
     tag_single_use(Patterns, Tagged),
     
     % Step 9: Emit rewritten Prolog + proof notes/tests
-    emit_rewritten(Tagged, OutputFile, ProofNotes),
+    emit_rewritten(ClosedForms, Tagged, OutputFile, ProofNotes),
     
     % Display summary
     format('~nProcessing complete.~n', []),
@@ -380,6 +383,26 @@ read_clauses_from_stream(Stream, Clauses) :-
     (Term == end_of_file -> Clauses = []
     ; Clauses = [Term|Rest], read_clauses_from_stream(Stream, Rest)).
 
+%% Load clauses into Prolog environment for tracing
+load_clauses_for_tracing(Clauses) :-
+    % Filter out use_module directives and other non-clause terms
+    include(is_loadable_clause, Clauses, LoadableClauses),
+    % Assert each clause into the database
+    maplist(assert_clause_safely, LoadableClauses).
+
+is_loadable_clause((:- use_module(_))) :- !, fail.  % Skip use_module directives
+is_loadable_clause((:- module(_, _))) :- !, fail.   % Skip module declarations
+is_loadable_clause((:- _)) :- !, fail.  % Skip other directives (they may have side effects)
+is_loadable_clause(_) :- true.  % Accept all actual clauses
+
+assert_clause_safely(Clause) :-
+    catch(
+        % Assert into the user module so predicates are globally accessible
+        user:assertz(Clause),
+        Error,
+        (format('Warning: Could not load clause ~w: ~w~n', [Clause, Error]), true)
+    ).
+
 %% Parse clauses from a list (for testing)
 parse_clauses(Terms, ParsedClauses) :-
     maplist(parse_single_clause, Terms, ParsedClauses).
@@ -538,9 +561,9 @@ infer_relationships(FlattenedEqs, Relationships) :-
         % Build equations from traced data
         build_equations_from_trace(TraceData, EquationSystem),
         % Apply Gaussian elimination to find relationships
-        gaussian_elimination(EquationSystem, ReducedMatrix),
-        % Extract closed-form relationships
-        extract_relationships(ReducedMatrix, Relationships)
+        gaussian_eliminate_system(EquationSystem, Solutions),
+        % Extract closed-form relationships from solutions
+        extract_relationships_from_solutions(Solutions, TraceData, Relationships)
     ;
         % Fallback to symbolic analysis
         extract_variable_matrix(FlattenedEqs, Matrix),
@@ -566,16 +589,20 @@ trace_predicate(Pred-_Indices, trace(Pred, DataPoints)) :-
 functor_name_arity(Name/Arity, Name, Arity).
 
 generate_test_inputs(Arity, TestInputs) :-
-    % Generate small test inputs (0-10)
-    NumTests = 5,
+    % Generate small test inputs (0-6 for better polynomial fitting)
+    NumTests = 7,
+    InputArity is Arity - 1, % Last arg is usually output
+    MaxN is NumTests - 1,
     findall(Inputs,
-            (between(1, NumTests, _),
-             generate_input_tuple(Arity, Inputs)),
+            (between(0, MaxN, N),
+             generate_input_for_n(InputArity, N, Inputs)),
             TestInputs).
 
-generate_input_tuple(Arity, Inputs) :-
-    InputArity is Arity - 1, % Last arg is usually output
-    findall(N, (between(1, InputArity, _), random_between(0, 10, N)), Inputs).
+generate_input_for_n(1, N, [N]) :- !.  % Single input: use N directly
+generate_input_for_n(Arity, N, Inputs) :-
+    % Multiple inputs: generate list with Arity copies of N
+    % (all inputs receive the same value for simplicity)
+    findall(N, between(1, Arity, _), Inputs).
 
 collect_outputs(_Name, _Arity, [], []).
 collect_outputs(Name, Arity, [Inputs|RestInputs], [point(Inputs, Output)|RestPoints]) :-
@@ -585,31 +612,61 @@ collect_outputs(Name, Arity, [Inputs|RestInputs], [point(Inputs, Output)|RestPoi
     ; Output = undefined),
     collect_outputs(Name, Arity, RestInputs, RestPoints).
 
-safe_call_predicate(_Name, _Arity, _Inputs, undefined) :-
-    % PLACEHOLDER: For now, return undefined as we can't safely call arbitrary predicates
-    % In a full implementation, this would use sandboxing and dynamic predicate calling
-    % The gaussian_eliminate_system works independently of this
-    !.
+safe_call_predicate(Name, Arity, Inputs, Output) :-
+    % Try to call the predicate with the given inputs
+    % Construct the predicate call with inputs and an output variable
+    length(Inputs, InputLen),
+    OutputArity is Arity - InputLen,
+    (OutputArity =:= 1 ->
+        % Single output argument
+        append(Inputs, [Output], Args),
+        Goal =.. [Name|Args],
+        catch(
+            call(Goal),
+            _Error,
+            fail
+        )
+    ; 
+        % Multiple outputs or no outputs - not yet supported
+        fail
+    ).
 
 %% Build system of equations from trace data
 build_equations_from_trace(TraceData, EquationSystem) :-
     findall(Equation,
             extract_equation_from_trace(TraceData, Equation),
-            EquationSystem).
+            AllEquations),
+    % For a cubic polynomial (degree 3), we need degree+1 = 4 equations
+    % Limit to this number (or the number available if fewer)
+    polynomial_degree(3, NumEquationsNeeded),
+    (length(AllEquations, Len), Len >= NumEquationsNeeded ->
+        length(LimitedEquations, NumEquationsNeeded),
+        append(LimitedEquations, _, AllEquations),
+        EquationSystem = LimitedEquations
+    ; EquationSystem = AllEquations).
 
-extract_equation_from_trace(TraceData, equation(Vars, Coeffs, Result)) :-
+% Define the polynomial degree used for fitting
+polynomial_degree(Degree, NumEquations) :-
+    NumEquations is Degree + 1.
+
+extract_equation_from_trace(TraceData, equation(Vars, Result)) :-
     member(trace(_Pred, DataPoints), TraceData),
     member(point(Inputs, Output), DataPoints),
     Output \= undefined,
     % Build equation variables (1, n, n^2, n^3, etc.)
     build_polynomial_vars(Inputs, Vars),
     % Result is the output
-    Result = Output,
-    % Initialize coefficients (to be found)
-    length(Vars, Len),
-    findall(_, between(1, Len, _), Coeffs).
+    Result = Output.
+
+%% Extract relationships from solutions (coefficients from Gaussian elimination)
+extract_relationships_from_solutions(Solutions, TraceData, Relationships) :-
+    % For each traced predicate, create a relationship with the found coefficients
+    findall(relation(Pred, formula(Solutions)),
+            member(trace(Pred, _), TraceData),
+            Relationships).
 
 build_polynomial_vars([N], Vars) :-
+    !,  % Cut to prevent backtracking
     % For single input, build polynomial: [1, N, N^2, N^3]
     Vars = [1, N, N2, N3],
     N2 is N * N,
@@ -728,7 +785,7 @@ build_relation_expr([V|Vs], [C|Cs], Expr) :-
 %% Derive closed-form/flattened formulas
 derive_closed_form(Relationships, ClosedForms) :-
     findall(closed_form(Pred, Formula),
-            derive_formula(Relationships, Pred, Formula),
+            (member(relation(Pred, Formula), Relationships)),
             ClosedForms).
 
 derive_formula(Relationships, Pred, Formula) :-
@@ -864,22 +921,46 @@ tag_pattern(Patterns, Pattern, Tag) :-
     ; Tag = reusable(Name, Usages)).
 
 %% Emit rewritten Prolog + proof notes/tests
-emit_rewritten(Tagged, OutputFile, ProofFile) :-
+emit_rewritten(ClosedForms, Tagged, OutputFile, ProofFile) :-
     atom_concat(OutputFile, '.proof', ProofFile),
     open(OutputFile, write, OutStream),
     open(ProofFile, write, ProofStream),
     
-    write_rewritten_code(OutStream, Tagged),
-    write_proof_notes(ProofStream, Tagged),
-    write_test_cases(OutStream, Tagged),
+    write_rewritten_code(OutStream, ClosedForms, Tagged),
+    write_proof_notes(ProofStream, ClosedForms, Tagged),
+    write_test_cases(OutStream, ClosedForms, Tagged),
     
     close(OutStream),
     close(ProofStream).
 
-write_rewritten_code(Stream, Tagged) :-
+write_rewritten_code(Stream, ClosedForms, Tagged) :-
     format(Stream, '%% Rewritten Prolog - Mathematical Induction Form~n', []),
     format(Stream, '%% Generated by mi.pl~n~n', []),
+    write_closed_form_predicates(Stream, ClosedForms),
     write_optimized_predicates(Stream, Tagged).
+
+write_closed_form_predicates(Stream, ClosedForms) :-
+    (ClosedForms \= [] ->
+        format(Stream, '%% Derived Closed-Form Formulas~n', []),
+        maplist(write_closed_form(Stream), ClosedForms),
+        format(Stream, '~n', [])
+    ; true).
+
+write_closed_form(Stream, closed_form(Pred, formula(Coeffs))) :-
+    format(Stream, '%% Closed-form for ~w:~n', [Pred]),
+    format(Stream, '%%   Coefficients: ~w~n', [Coeffs]),
+    format(Stream, '%%   Formula: ', []),
+    write_formula_human(Stream, Coeffs),
+    format(Stream, '~n~n', []).
+
+write_formula_human(Stream, Coeffs) :-
+    % Handle cubic polynomials (4 coefficients)
+    (Coeffs = [C0, C1, C2, C3] ->
+        format(Stream, '~w + ~w*n + ~w*n^2 + ~w*n^3', [C0, C1, C2, C3])
+    ;
+        % Fallback for other polynomial degrees
+        format(Stream, 'Coefficients: ~w', [Coeffs])
+    ).
 
 write_optimized_predicates(Stream, Tagged) :-
     findall(Pred, 
@@ -902,11 +983,20 @@ write_predicate(Stream, helper(Name, Pattern)) :-
 write_predicate(Stream, inline(Pattern)) :-
     format(Stream, '% Inline pattern: ~w~n', [Pattern]).
 
-write_proof_notes(Stream, Tagged) :-
+write_proof_notes(Stream, ClosedForms, Tagged) :-
     format(Stream, '%% Proof Notes and Verification~n', []),
     format(Stream, '%% Generated by mi.pl~n~n', []),
+    write_closed_form_summary(Stream, ClosedForms),
     write_pattern_analysis(Stream, Tagged),
     write_optimization_notes(Stream, Tagged).
+
+write_closed_form_summary(Stream, ClosedForms) :-
+    format(Stream, '% Closed-Form Analysis:~n', []),
+    length(ClosedForms, NumForms),
+    format(Stream, '% Total closed forms derived: ~w~n', [NumForms]),
+    forall(member(closed_form(Pred, formula(Coeffs)), ClosedForms),
+           format(Stream, '%   ~w: ~w~n', [Pred, Coeffs])),
+    format(Stream, '~n', []).
 
 write_pattern_analysis(Stream, Tagged) :-
     format(Stream, '% Pattern Analysis:~n', []),
@@ -927,11 +1017,18 @@ write_pattern_note(Stream, tagged(_Pattern, Tag)) :-
         format(Stream, '% Pattern ~w: single use (kept inline)~n', [Name])
     ; true).
 
-write_test_cases(Stream, Tagged) :-
+write_test_cases(Stream, ClosedForms, Tagged) :-
     format(Stream, '~n%% Generated Test Cases~n', []),
     format(Stream, ':- begin_tests(mi_generated).~n~n', []),
+    generate_tests_from_forms(Stream, ClosedForms),
     generate_tests(Stream, Tagged),
     format(Stream, ':- end_tests(mi_generated).~n', []).
+
+generate_tests_from_forms(Stream, ClosedForms) :-
+    (ClosedForms \= [] ->
+        forall(member(closed_form(Pred, formula(_Coeffs)), ClosedForms),
+               format(Stream, 'test(derived_~w) :- true. % TODO: Add validation tests~n', [Pred]))
+    ; true).
 
 generate_tests(Stream, Tagged) :-
     length(Tagged, N),
