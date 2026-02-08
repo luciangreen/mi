@@ -429,7 +429,7 @@ count_body_goals(_, 1).
 
 %% Detect recursive and nested predicates
 detect_recursive(Clauses, RecursiveInfo) :-
-    findall(recursive(Name/Arity, Type, Clause),
+    findall(recursive(Name/Arity, Type, [Clause]),
             (member(Clause, Clauses),
              is_recursive_clause(Clause, Name/Arity, Type)),
             RecursiveInfo).
@@ -481,7 +481,7 @@ build_equations(RecursiveInfo, Equations) :-
             Equations).
 
 build_equation_for_recursive(RecursiveInfo, Pred, Indices, Expr) :-
-    member(recursive(Pred, Type, Clause), RecursiveInfo),
+    member(recursive(Pred, Type, [Clause]), RecursiveInfo),
     extract_subterm_addresses(Clause, Addresses),
     build_equation_expr(Clause, Type, Addresses, Indices, Expr).
 
